@@ -8,9 +8,7 @@
 -export([code_change/4]).
 
 -record(data, {
-	ref,
 	opts,
-	timer,
 	attempt,
 	return_data
 }).
@@ -33,105 +31,96 @@ init(Args) ->
 	erlang:error(not_implemented, [Args]).
 
 handle_event(internal, {init, Opts}, State, Data) ->
-	Ref=make_ref(),
 	{
 		next_state,
-		{?MODULE, Ref},
+		{?MODULE, undefined},
 		#data{
-			ref=Ref,
 			opts=normalize_opts(Opts, State),
 			attempt=0,
 			return_data=Data
 		},
 		[{next_event, internal, sleep}]
 	};
-handle_event(internal, sleep, {?MODULE, Ref}, Data=#data{ref=Ref, opts=Opts}) ->
+handle_event(internal, sleep, {?MODULE, undefined}, Data=#data{opts=Opts}) ->
 	case get_timeout(Data#data.attempt, maps:get(strategy, Opts)) of
 		error ->
 			{
 				next_state,
-				maps:get(error_state, Opts),
-				Data#data.return_data,
-				[pop_callback_module]
+				{?MODULE, returning},
+				Data,
+				[{next_event, internal, {return, error}}]
 			};
 		{ok, Timeout} ->
-			Timer=erlang:start_timer(Timeout, self(), wakeup),
 			{
-				keep_state,
-				Data#data{
-					timer=Timer,
-					attempt=Data#data.attempt+1
-				}
+				next_state,
+				{?MODULE, sleeping},
+				Data#data{attempt=Data#data.attempt+1},
+				[{state_timeout, Timeout, wakeup}]
 			}
 	end;
-handle_event(info, {timeout, Timer0, wakeup}, {?MODULE, Ref}, Data=#data{ref=Ref, opts=Opts, timer=Timer0}) ->
+handle_event(state_timeout, wakeup, {?MODULE, sleeping}, Data=#data{opts=Opts}) ->
 	Callback=maps:get(callback, Opts),
 	CallbackTimeout=maps:get(callback_timeout, Opts),
 	Self=self(),
 	Tag=make_ref(),
 	{Pid, Mon}=spawn_monitor(fun () -> Self ! {Tag, Callback(Data#data.return_data)} end),
-	Result=receive
-		{Tag, Result1} ->
-			demonitor(Mon, [flush]),
-			Result1;
-		{'DOWN', Mon, process, Pid, _Reason} ->
-			{retry, Data#data.return_data}
-	after CallbackTimeout ->
-		exit(Pid, kill),
-		receive
-			{Tag, Result1} ->
-				demonitor(Mon, [flush]),
-				Result1;
-			{'DOWN', Mon, process, Pid, _Reason} ->
-				{retry, Data#data.return_data}
-		end
-	end,
+	{next_state, {?MODULE, {executing, Tag, Pid, Mon}}, Data, [{state_timeout, CallbackTimeout, timeout}]};
+handle_event(state_timeout, timeout, {?MODULE, {executing, _, Pid, Mon}}, Data=#data{opts=Opts}) ->
+	demonitor(Mon, [flush]),
+	exit(Pid, kill),
+	{next_state, maps:get(error_state, Opts), Data#data.return_data, [pop_callback_module]};
+handle_event(info, {Tag, Result}, {?MODULE, {executing, Tag, _, Mon}}, Data) ->
+	demonitor(Mon, [flush]),
 	case Result of
 		{ok, NewReturnData} ->
 			{
 				next_state,
-				maps:get(success_state, Opts),
-				NewReturnData,
-				[pop_callback_module]
+				{?MODULE, returning},
+				Data#data{return_data=NewReturnData},
+				[{next_event, internal, {return, success}}]
 			};
 		{retry, NewReturnData} ->
 			{
-				keep_state,
-				Data#data{
-					timer=undefined,
-					return_data=NewReturnData
-				},
+				next_state,
+				{?MODULE, undefined},
+				Data#data{return_data=NewReturnData},
 				[{next_event, internal, sleep}]
 			};
 		{stop, NewReturnData} ->
 			{
 				next_state,
-				maps:get(error_state, Opts),
-				NewReturnData,
-				[pop_callback_module]
+				{?MODULE, returning},
+				Data#data{return_data=NewReturnData},
+				[{next_event, internal, {return, error}}]
 			}
 	end;
-handle_event({call, _From}, _Msg, {?MODULE, Ref}, #data{ref=Ref, opts=#{external_events:=ignore}}) ->
+handle_event(info, {'DOWN', Mon, process, Pid, _}, {?MODULE, {executing, _, Pid, Mon}}, Data=#data{opts=Opts}) ->
+	{next_state, maps:get(error_state, Opts), Data#data.return_data, [pop_callback_module]};
+handle_event(internal, {return, success}, {?MODULE, returning}, Data=#data{opts=Opts}) ->
+	{next_state, maps:get(success_state, Opts), Data#data.return_data, [pop_callback_module]};
+handle_event(internal, {return, error}, {?MODULE, returning}, Data=#data{opts=Opts}) ->
+	{next_state, maps:get(error_state, Opts), Data#data.return_data, [pop_callback_module]};
+handle_event({call, _From}, _Msg, {?MODULE, _}, #data{opts=#{external_events:=ignore}}) ->
 	keep_state_and_data;
-handle_event({call, _From}, _Msg, {?MODULE, Ref}, #data{ref=Ref, opts=#{external_events:=postpone}}) ->
+handle_event({call, _From}, _Msg, {?MODULE, _}, #data{opts=#{external_events:=postpone}}) ->
 	{keep_state_and_data, [postpone]};
-handle_event({call, From}, _Msg, {?MODULE, Ref}, #data{ref=Ref, opts=#{external_events:={reply_or_ignore, Reply}}}) ->
+handle_event({call, From}, _Msg, {?MODULE, _}, #data{opts=#{external_events:={reply_or_ignore, Reply}}}) ->
 	{keep_state_and_data, [{reply, From, Reply}]};
-handle_event(cast, _Msg, {?MODULE, Ref}, #data{ref=Ref, opts=#{external_events:=ignore}}) ->
+handle_event(cast, _Msg, {?MODULE, _}, #data{opts=#{external_events:=ignore}}) ->
 	keep_state_and_data;
-handle_event(cast, _Msg, {?MODULE, Ref}, #data{ref=Ref, opts=#{external_events:=postpone}}) ->
+handle_event(cast, _Msg, {?MODULE, _}, #data{opts=#{external_events:=postpone}}) ->
 	{keep_state_and_data, [postpone]};
-handle_event(cast, _Msg, {?MODULE, Ref}, #data{ref=Ref, opts=#{external_events:={reply_or_ignore, _Reply}}}) ->
+handle_event(cast, _Msg, {?MODULE, _}, #data{opts=#{external_events:={reply_or_ignore, _Reply}}}) ->
 	keep_state_and_data;
-handle_event(info, _Msg, {?MODULE, Ref}, #data{ref=Ref, opts=#{external_events:=ignore}}) ->
+handle_event(info, _Msg, {?MODULE, _}, #data{opts=#{external_events:=ignore}}) ->
 	keep_state_and_data;
-handle_event(info, _Msg, {?MODULE, Ref}, #data{ref=Ref, opts=#{external_events:=postpone}}) ->
+handle_event(info, _Msg, {?MODULE, _}, #data{opts=#{external_events:=postpone}}) ->
 	{keep_state_and_data, [postpone]};
-handle_event(info, _Msg, {?MODULE, Ref}, #data{ref=Ref, opts=#{external_events:={reply_or_ignore, _Reply}}}) ->
+handle_event(info, _Msg, {?MODULE, _}, #data{opts=#{external_events:={reply_or_ignore, _Reply}}}) ->
 	keep_state_and_data;
-handle_event({timeout, _Name}, _Msg, {?MODULE, Ref}, #data{ref=Ref, opts=#{timeout_events:=ignore}}) ->
+handle_event({timeout, _Name}, _Msg, {?MODULE, _}, #data{opts=#{timeout_events:=ignore}}) ->
 	keep_state_and_data;
-handle_event({timeout, _Name}, _Msg, {?MODULE, Ref}, #data{ref=Ref, opts=#{timeout_events:=postpone}}) ->
+handle_event({timeout, _Name}, _Msg, {?MODULE, _}, #data{opts=#{timeout_events:=postpone}}) ->
 	{keep_state_and_data, [postpone]};
 handle_event(_Type, _Msg, _State, _Data) ->
 	keep_state_and_data.

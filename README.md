@@ -16,10 +16,11 @@ The argument given to `gen_statem:enter_wait/1` must be a map or property list o
   * If the callback returns an `ok` tuple, this is a success and the state machine transitions to the state given in the `success_state` option.
   * If a `retry` tuple is returned, the callback is retried after the timeout defined by the `strategy` option. If the maximum number of attempts is exhausted, the state machine transitions to the state given in the `error_state` option.
   * If a `stop` tuple is returned, this means giving up, and the state machine transitions to the state given in the `error_state` option.
+  * If the callback crashes without returning anything, the state machine transitions to the state given in the `error_state` option.
 
 * `callback_timeout => timeout()` (optional, default `infinity`)
 
-  Maximum allowed time for the callback to execute. If the callback does not return within this time, it is killed and scheduled for retry.
+  Maximum allowed time for the callback to execute. If the callback does not return within this time, it is killed and the state machine transitions to the state given in the `error_state` option.
 
 * `strategy => {simple, StrategyOpts :: map()} | {custom, fun((Attempt :: non_neg_integer()) -> {ok, non_neg_integer()} | error)}` (mandatory)
   
