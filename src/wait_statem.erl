@@ -65,7 +65,7 @@ handle_event(state_timeout, wakeup, {?MODULE, sleeping}, Data=#data{opts=Opts}) 
 	CallbackTimeout=maps:get(callback_timeout, Opts),
 	Self=self(),
 	Tag=make_ref(),
-	{Pid, Mon}=spawn_monitor(fun () -> Self ! {Tag, Callback(Data#data.return_data)} end),
+	{Pid, Mon}=spawn_monitor(fun () -> Self ! {Tag, execute_callback(Callback, Data#data.return_data)} end),
 	{
 		next_state,
 		{?MODULE, {executing, Tag, Pid, Mon}},
@@ -173,13 +173,13 @@ handle_common_event({reply, Reply}, {call, From}, _Msg, {?MODULE, _}, _Data) ->
 		keep_state_and_data,
 		[{reply, From, Reply}]
 	};
-handle_common_event(Fun, _Type, _Msg, {?MODULE, {executing, _, _, _}}, _Data) when is_function(Fun, 3) ->
+handle_common_event(_Callback, _Type, _Msg, {?MODULE, {executing, _, _, _}}, _Data) ->
 	{
 		keep_state_and_data,
 		[postpone]
 	};
-handle_common_event(Fun, Type, Msg, {?MODULE, _}, Data) when is_function(Fun, 3) ->
-	case Fun(Type, Msg, Data#data.return_data) of
+handle_common_event(Callback, Type, Msg, {?MODULE, _}, Data) ->
+	case execute_event(Callback, Type, Msg, Data#data.return_data) of
 		ignore ->
 			keep_state_and_data;
 		{ignore, NewReturnData} ->
@@ -209,12 +209,27 @@ handle_common_event(Fun, Type, Msg, {?MODULE, _}, Data) when is_function(Fun, 3)
 code_change(_OldVsn, State, Data, _Extra) ->
 	{ok, State, Data}.
 
+execute_callback({Mod, Fun}, Data) ->
+	Mod:Fun(Data);
+execute_callback(Fun, Data) ->
+	Fun(Data).
+
+execute_custom_timeout({Mod, Fun}, N) ->
+	Mod:Fun(N);
+execute_custom_timeout(Fun, N) ->
+	Fun(N).
+
+execute_event({Mod, Fun}, Type, Msg, Data) ->
+	Mod:Fun(Type, Msg, Data);
+execute_event(Fun, Type, Msg, Data) ->
+	Fun(Type, Msg, Data).
+
 get_timeout(N, {simple, #{max:=Max}}) when is_integer(Max), N>=Max ->
 	error;
 get_timeout(N, {simple, #{delay:=Delay, time:=Time, backoff:=Backoff, jitter:=Jitter}}) ->
 	{ok, Delay + round(calc_backoff(N, Time, Backoff) + calc_jitter(Jitter))};
-get_timeout(N, {custom, Fun}) ->
-	Fun(N).
+get_timeout(N, {custom, Callback}) ->
+	execute_custom_timeout(Callback, N).
 
 calc_backoff(0, _T, _B) ->
 	0;
@@ -255,10 +270,14 @@ normalize_opts1(Opts0, State) ->
 	},
 	maps:map(
 		fun
-			(callback, Callback) when is_function(Callback, 1) ->
+			(callback, Callback={Mod, Fun}) when is_atom(Mod), is_atom(Fun) ->
 				Callback;
+			(callback, Fun) when is_function(Fun, 1) ->
+				Fun;
 			(strategy, {simple, StrategyOpts}) when is_map(StrategyOpts); is_list(StrategyOpts) ->
 				{simple, normalize_strategy_opts(StrategyOpts)};
+			(strategy, Strategy={custom, {Mod, Fun}}) when is_atom(Mod), is_atom(Fun) ->
+				Strategy;
 			(strategy, Strategy={custom, Fun}) when is_function(Fun, 1) ->
 				Strategy;
 			(callback_timeout, infinity) ->
@@ -275,6 +294,8 @@ normalize_opts1(Opts0, State) ->
 				{reply, Reply};
 			(call_events, {reply_or_ignore, Reply}) ->
 				{reply, Reply};
+			(call_events, Callback={Mod, Fun}) when is_atom(Mod), is_atom(Fun) ->
+				Callback;
 			(call_events, Fun) when is_function(Fun, 3) ->
 				Fun;
 			(cast_events, postpone) ->
@@ -285,6 +306,8 @@ normalize_opts1(Opts0, State) ->
 				postpone;
 			(cast_events, {reply_or_ignore, _Reply}) ->
 				ignore;
+			(cast_events, Callback={Mod, Fun}) when is_atom(Mod), is_atom(Fun) ->
+				Callback;
 			(cast_events, Fun) when is_function(Fun, 3) ->
 				Fun;
 			(info_events, postpone) ->
@@ -295,12 +318,16 @@ normalize_opts1(Opts0, State) ->
 				postpone;
 			(info_events, {reply_or_ignore, _Reply}) ->
 				ignore;
+			(info_events, Callback={Mod, Fun}) when is_atom(Mod), is_atom(Fun) ->
+				Callback;
 			(info_events, Fun) when is_function(Fun, 3) ->
 				Fun;
 			(timeout_events, ignore) ->
 				ignore;
 			(timeout_events, postpone) ->
 				postpone;
+			(timeout_events, Callback={Mod, Fun}) when is_atom(Mod), is_atom(Fun) ->
+				Callback;
 			(timeout_events, Fun) when is_function(Fun, 3) ->
 				Fun;
 			(success_state, SuccessState) ->
