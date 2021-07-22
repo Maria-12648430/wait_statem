@@ -10,14 +10,13 @@
 
 -record(data, {
 	tag,
+	state,
 	opts,
 	attempt=0,
 	last_attempt,
 	module,
 	cb_mode,
-	cur_state,
-	return_data,
-	postponed=[]
+	return_data
 }).
 
 get_callback_mode(Module) ->
@@ -55,98 +54,91 @@ init(Args) ->
 handle_event(internal, {init, Module, Opts}, State, Data) ->
 	Tag=make_ref(),
 	{
-		next_state,
-		{?MODULE, awake},
+		keep_state,
 		#data{
-			opts=normalize_opts(Opts, State),
 			tag=Tag,
+			state=awake,
+			opts=normalize_opts(Opts, State),
 			attempt=0,
 			module=Module,
 			cb_mode=get_callback_mode(Module),
-			cur_state=State,
 			return_data=Data
 		},
 		[{next_event, internal, {Tag, sleep}}]
 	};
-handle_event(internal, {Tag, sleep}, {?MODULE, awake}, Data=#data{tag=Tag, opts=Opts}) ->
-	BaseTime=case {Data#data.last_attempt, maps:get(timing, Opts)} of
-		{undefined, _} ->
-			erlang:monotonic_time(millisecond);
-		{_, relative} ->
-			erlang:monotonic_time(millisecond);
-		{LastAttempt, absolue} ->
-			LastAttempt
-	end,
-	case get_timeout(Data#data.module, maps:get(strategy, Opts), Data#data.attempt, Data#data.cur_state, Data#data.return_data) of
+handle_event(internal, {Tag, sleep}, State, Data=#data{tag=Tag, state=awake, opts=Opts}) ->
+	case get_timeout(Data#data.module, maps:get(strategy, Opts), Data#data.attempt, State, Data#data.return_data) of
 		error ->
 			{
-				next_state,
-				{?MODULE, returning},
-				Data,
+				keep_state,
+				Data#data{
+					state=returning
+				},
 				[{next_event, internal, {Tag, error}}]
 			};
 		{error, NewReturnData} ->
 			{
-				next_state,
-				{?MODULE, returning},
+				keep_state,
 				Data#data{
+					state=returning,
 					return_data=NewReturnData
 				},
 				[{next_event, internal, {Tag, error}}]
 			};
 		{ok, Timeout} when is_integer(Timeout), Timeout>=0 ->
 			{
-				next_state,
-				{?MODULE, sleeping},
+				keep_state,
 				Data#data{
+					state=sleeping,
 					attempt=Data#data.attempt+1
 				},
-				[{state_timeout, BaseTime+Timeout, {Tag, wakeup}, {abs, true}}]
+				[{{timeout, {Tag, sleeping}}, get_basetime(Data#data.last_attempt, maps:get(timing, Opts))+Timeout, {Tag, wakeup}, {abs, true}}]
 			};
 		{ok, Timeout, NewReturnData} when is_integer(Timeout), Timeout>=0 ->
 			{
-				next_state,
-				{?MODULE, sleeping},
+				keep_state,
 				Data#data{
+					state=sleeping,
 					attempt=Data#data.attempt+1,
 					return_data=NewReturnData
 				},
-				[{state_timeout, BaseTime+Timeout, {Tag, wakeup}, {abs, true}}]
+				[{{timeout, {Tag, sleeping}}, get_basetime(Data#data.last_attempt, maps:get(timing, Opts))+Timeout, {Tag, wakeup}, {abs, true}}]
 			}
 	end;
-handle_event(state_timeout, {Tag, wakeup}, {?MODULE, sleeping}, Data=#data{tag=Tag, opts=Opts}) ->
+handle_event({timeout, {Tag, sleeping}}, {Tag, wakeup}, State, Data=#data{tag=Tag, state=sleeping, opts=Opts}) ->
 	ExecTime=erlang:monotonic_time(millisecond),
-	case execute_callback(Data#data.module, maps:get(callback, Opts), Data#data.cur_state, Data#data.return_data) of
+	case execute_callback(Data#data.module, maps:get(callback, Opts), State, Data#data.return_data) of
 		ok ->
 			{
-				next_state,
-				{?MODULE, returning},
-				Data,
+				keep_state,
+				Data#data{
+					state=returning
+				},
 				[{next_event, internal, {Tag, success}}]
 			};
 		{ok, NewReturnData} ->
 			{
-				next_state,
-				{?MODULE, returning},
+				keep_state,
 				Data#data{
+					state=returning,
 					return_data=NewReturnData
 				},
 				[{next_event, internal, {Tag, success}}]
 			};
 		retry ->
 			{
-				next_state,
-				{?MODULE, awake},
+				keep_state,
 				Data#data{
+					state=awake,
 					last_attempt=ExecTime
 				},
 				[{next_event, internal, {Tag, sleep}}]
 			};
 		{retry, NewReturnData} ->
 			{
-				next_state,
-				{?MODULE, awake},
+				keep_state,
 				Data#data{
+					state=awake,
 					last_attempt=ExecTime,
 					return_data=NewReturnData
 				},
@@ -154,124 +146,100 @@ handle_event(state_timeout, {Tag, wakeup}, {?MODULE, sleeping}, Data=#data{tag=T
 			};
 		error ->
 			{
-				next_state,
-				{?MODULE, returning},
-				Data,
+				keep_state,
+				Data#data{
+					state=returning
+				},
 				[{next_event, internal, {Tag, error}}]
 			};
 		{error, NewReturnData} ->
 			{
-				next_state,
-				{?MODULE, returning},
+				keep_state,
 				Data#data{
+					state=returning,
 					return_data=NewReturnData
 				},
 				[{next_event, internal, {Tag, error}}]
 			}
 	end;
-handle_event(internal, {Tag, success}, {?MODULE, returning}, Data=#data{tag=Tag, opts=#{success_state:=SuccessState}}) ->
+handle_event(internal, {Tag, success}, _State, Data=#data{tag=Tag, state=returning, opts=#{success_state:=SuccessState}}) ->
 	{
 		next_state,
-		Data#data.cur_state,
-		Data#data{postponed=[]},
-		lists:reverse([{next_event, internal, {Tag, return, SuccessState}}|Data#data.postponed])
-	};
-handle_event(internal, {Tag, error}, {?MODULE, returning}, Data=#data{tag=Tag, opts=#{error_state:=ErrorState}}) ->
-	{
-		next_state,
-		Data#data.cur_state,
-		Data#data{postponed=[]},
-		lists:reverse([{next_event, internal, {Tag, return, ErrorState}}|Data#data.postponed])
-	};
-handle_event(internal, {Tag, return, ReturnState}, CurState, Data=#data{tag=Tag, cur_state=CurState}) ->
-	{
-		next_state,
-		ReturnState,
+		SuccessState,
 		Data#data.return_data,
-		[pop_callback_module]
+		[{{timeout, Tag}, cancel}, pop_callback_module]
 	};
-handle_event(_Event, _Msg, CurState, #data{cur_state=CurState}) ->
+handle_event(internal, {Tag, error}, _State, Data=#data{tag=Tag, opts=#{error_state:=ErrorState}}) ->
+	{
+		next_state,
+		ErrorState,
+		Data#data.return_data,
+		[{{timeout, Tag}, cancel}, pop_callback_module]
+	};
+handle_event({timeout, {Tag, event}}, Msg, _State, #data{tag=Tag}) ->
 	{
 		keep_state_and_data,
-		[postpone]
+		[{next_event, timeout, Msg}]
 	};
-handle_event(Type, Msg, State={?MODULE, _}, Data) ->
+handle_event(Type, Msg, State, Data) ->
 	handle_common_event(Type, Msg, State, Data).
 
-handle_common_event(Type, Msg, {?MODULE, _}, Data) ->
-	case execute_event(Data#data.cb_mode, Data#data.module, Type, Msg, Data#data.cur_state, Data#data.return_data) of
+handle_common_event(Type, Msg, State, Data=#data{tag=Tag}) ->
+	EvtTimerCancel={{timeout, {Tag, event}}, cancel},
+	case execute_event(Data#data.cb_mode, Data#data.module, Type, Msg, State, Data#data.return_data) of
 		keep_state_and_data ->
 			keep_state_and_data;
 		{keep_state_and_data, Actions} ->
-			case validate_actions(Actions) of
-				{true, Actions1} ->
-					{
-						keep_state,
-						Data#data{
-							postponed=[{next_event, Type, Msg}|Data#data.postponed]
-						},
-						Actions1
-					};
-				{false, Actions1} ->
-					{
-						keep_state_and_data,
-						Actions1
-					}
-			end;
+			{
+				keep_state_and_data,
+				[EvtTimerCancel|validate_actions(Actions, Tag)]
+			};
 		{keep_state, NewReturnData} ->
 			{
 				keep_state,
 				Data#data{
 					return_data=NewReturnData
-				}
+				},
+				[EvtTimerCancel]
 			};
 		{keep_state, NewReturnData, Actions} ->
-			case validate_actions(Actions) of
-				{true, Actions1} ->
-					{
-						keep_state,
-						Data#data{
-							return_data=NewReturnData,
-							postponed=[{next_event, Type, Msg}|Data#data.postponed]
-						},
-						Actions1
-					};
-				{false, Actions1} ->
-					{
-						keep_state,
-						Data#data{
-							return_data=NewReturnData
-						},
-						Actions1
-					}
-			end;
-		{next_state, NewState, NewReturnData} when NewState=:=Data#data.cur_state ->
 			{
 				keep_state,
 				Data#data{
 					return_data=NewReturnData
-				}
+				},
+				[EvtTimerCancel|validate_actions(Actions, Tag)]
 			};
-		{next_state, NewState, NewReturnData, Actions} when NewState=:=Data#data.cur_state ->
-			case validate_actions(Actions) of
-				{true, Actions1} ->
-					{
-						keep_state,
-						Data#data{
-							return_data=NewReturnData,
-							postponed=[{next_event, Type, Msg}|Data#data.postponed]
-						},
-						Actions1
-					};
-				{false, Actions1} ->
-					{
-						keep_state,
-						Data#data{
-							return_data=NewReturnData
-						},
-						Actions1
-					}
-			end;
+		{next_state, State, NewReturnData} ->
+			{
+				keep_state,
+				Data#data{
+					return_data=NewReturnData
+				},
+				[EvtTimerCancel]
+			};
+		{next_state, State, NewReturnData, Actions} ->
+			{
+				keep_state,
+				Data#data{
+					return_data=NewReturnData
+				},
+				[EvtTimerCancel|validate_actions(Actions, Tag)]
+			};
+		{next_state, NewState, NewReturnData} ->
+			{
+				next_state,
+				NewState,
+				NewReturnData,
+				[{{timeout, {Tag, sleeping}}, cancel}, EvtTimerCancel, pop_callback_module]
+			};
+		{next_state, NewState, NewReturnData, Actions} ->
+			{
+				next_state,
+				NewState,
+				NewReturnData,
+				[{{timeout, Tag}, cancel}, EvtTimerCancel, pop_callback_module|Actions]
+			};
 		stop ->
 			stop;
 		{stop, Reason} ->
@@ -304,46 +272,43 @@ handle_common_event(Type, Msg, {?MODULE, _}, Data) ->
 			}
 	end.
 
-terminate(Reason, _State, Data=#data{module=Module}) ->
-	Module:terminate(Reason, Data#data.cur_state, Data#data.return_data).
+terminate(Reason, State, Data=#data{module=Module}) ->
+	Module:terminate(Reason, State, Data#data.return_data).
 
 code_change(_OldVsn, State, Data, _Extra) ->
 	{ok, State, Data}.
 
-validate_actions(Actions0) when is_list(Actions0) ->
-	{Postpone, Actions1}=lists:foldl(
-		fun
-			(postpone, {_, Acc}) ->
-				{true, Acc};
-			({postpone, Pp}, {_, Acc}) when is_boolean(Pp) ->
-				{Pp, Acc};
-			(Action, {PpAcc, Acc}) ->
-				true=valid_action(Action),
-				{PpAcc, [Action|Acc]}
-		end,
-		{false, []},
-		Actions0
-	),
-	{Postpone, lists:reverse(Actions1)};
-validate_actions(Action) ->
-	validate_actions([Action]).
+get_basetime(undefined, _Timing) ->
+	erlang:monotonic_time(millisecond);
+get_basetime(_LastAttempt, relative) ->
+	erlang:monotonic_time(millisecond);
+get_basetime(LastAttempt, absolute) ->
+	LastAttempt.
 
-valid_action({next_event, _Event, _Content}) ->
-	true;
-valid_action({reply, _From, _Reply}) ->
-	true;
-valid_action(hibernate) ->
-	true;
-valid_action({hibernate, _Hibernate}) ->
-	true;
-valid_action({{timeout, _Name}, _TimeoutiOrUpdate, _Content}) ->
-	true;
-valid_action({{timeout, _Name}, _Timeout, _Content, _Options}) ->
-	true;
-valid_action({{timeout, _Name}, cancel}) ->
-	true;
-valid_action(_Action) ->
-	false.
+validate_actions(Actions, Tag) when is_list(Actions) ->
+	lists:map(
+		fun
+			(A=postpone) -> A;
+			(A={postpone, _}) -> A;
+			(A={next_event, _, _}) -> A;
+			(A={reply, _, _}) -> A;
+			(A=hibernate) -> A;
+			(A={hibernate, _}) -> A;
+			(A={state_timeout, _}) -> A;
+			(A={state_timeout, _, _}) -> A;
+			(A={state_timeout, _, _, _}) -> A;
+			(A={{timeout, _}, _}) -> A;
+			(A={{timeout, _}, _, _}) -> A;
+			(A={{timeout, _}, _, _, _}) -> A;
+			({timeout, cancel}) -> {{timeout, {Tag, event}}, cancel};
+			({timeout, TimeOrUpdate, Content}) -> {{timeout, {Tag, event}}, TimeOrUpdate, Content};
+			({timeout, Time, Content, Opts}) -> {{timeout, {Tag, event}}, Time, Content, Opts};
+			(Time) when is_integer(Time); Time=:=infinity -> {{timeout, {Tag, event}}, Time, Time}
+		end,
+		Actions
+	);
+validate_actions(Action, Tag) ->
+	validate_actions([Action], Tag).
 
 execute_callback(Module, Fun, State, Data) when is_atom(Fun) ->
 	Module:Fun(State, Data);
